@@ -1,0 +1,1 @@
+# Sideswipe detectors module
