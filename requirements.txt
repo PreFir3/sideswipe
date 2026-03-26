@@ -1,0 +1,28 @@
+# Sideswipe - Gesture Control System Requirements
+
+# Core Computer Vision & ML
+opencv-python>=4.5.0
+mediapipe>=0.8.0
+numpy>=1.19.0
+scipy>=1.5.0
+
+# System Control & Automation
+pyobjc>=7.3  # macOS specific
+# pyautogui>=0.9.0  # Cross-platform automation (optional)
+
+# GUI & Visualization
+Pillow>=8.0.0
+
+# Data Processing
+pandas>=1.1.0
+
+# Development & Testing
+pytest>=6.2.0
+black>=21.0
+flake8>=3.9.0
+
+# Performance & Optimization
+numba>=0.54.0  # Optional: JIT compilation for slow functions
+
+# Logging & Monitoring
+colorama>=0.4.4

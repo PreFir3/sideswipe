@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Sideswipe Agent (Simple)",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["src/agent.py"],
+      "port": 0
+    },
+    {
+      "name": "Sideswipe Main (Full)",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["src/main.py"],
+      "port": 0
+    }
+  ]
+}
