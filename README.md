@@ -56,7 +56,11 @@ python3 src/agent.py
 3. **Scroll webpages**: 
    - Pinch your thumb and index finger together
    - Move your pinched hand up or down
-   - Uses Page Up/Down keys for scrolling
+    - Smooth, continuous scrolling (native scroll events when available)
+
+4. **Jump to a tab number (1–5)**:
+    - Hold up 1–5 fingers steadily for ~1 second
+    - Tip: this is automatically disabled while you're swiping or scrolling, so those gestures won't be misread as a tab-jump
 
 4. **Deactivate**: Clap twice again to turn off
 
@@ -67,6 +71,7 @@ python3 src/agent.py
 | 👏👏 Clap Twice | Toggle on/off |
 | 🔄 Swipe Left/Right | Switch tabs |
 | 📜 Pinch + Move | Scroll up/down |
+| 📌 Hold up 1–5 fingers (hold ~1s) | Jump to that tab number |
 | 'q' Key | Quit application |
 
 ## Project Structure
