@@ -5,9 +5,11 @@ Detects finger movement (middle finger) for vertical scrolling.
 """
 
 import numpy as np
-from typing import Optional
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+
+from config import FINGER_SCROLL
 
 
 class ScrollDirection(Enum):
@@ -40,7 +42,12 @@ class FingerScrollDetector:
     MIDDLE_TIP = 12
     MIDDLE_PIP = 10
     
-    def __init__(self, min_movement: float = 0.05, smoothing_frames: int = 5):
+    def __init__(
+        self,
+        min_movement: float = FINGER_SCROLL["min_movement"],
+        smoothing_frames: int = FINGER_SCROLL["smoothing_frames"],
+        activation_frames: int = FINGER_SCROLL["activation_frames"],
+    ):
         """
         Initialize finger scroll detector.
         
@@ -50,7 +57,8 @@ class FingerScrollDetector:
         """
         self.min_movement = min_movement
         self.smoothing_frames = smoothing_frames
-        self.position_history = []
+        self.activation_frames = activation_frames
+        self.position_history = deque(maxlen=smoothing_frames)
         self.gesture = FingerScrollGesture()
     
     def add_finger_position(self, y_pos: float) -> FingerScrollGesture:
@@ -65,25 +73,25 @@ class FingerScrollDetector:
         """
         # Add position to history
         self.position_history.append(y_pos)
-        
-        # Keep only recent positions
-        if len(self.position_history) > self.smoothing_frames:
-            self.position_history.pop(0)
-        
-        # Need at least 2 positions to detect movement
-        if len(self.position_history) < 2:
+
+        # Need a short stable run before detecting movement
+        if len(self.position_history) < self.activation_frames:
             self.gesture.direction = ScrollDirection.NONE
             self.gesture.is_active = False
             return self.gesture
-        
-        # Calculate movement (most recent vs previous)
-        current_y = self.position_history[-1]
-        previous_y = self.position_history[-2]
-        movement = current_y - previous_y
-        
-        # Calculate velocity (change per frame)
+
+        positions = list(self.position_history)
+        window_size = min(3, len(positions) // 2)
+        if window_size < 2:
+            self.gesture.direction = ScrollDirection.NONE
+            self.gesture.is_active = False
+            return self.gesture
+
+        recent_avg = sum(positions[-window_size:]) / window_size
+        previous_avg = sum(positions[-(window_size * 2):-window_size]) / window_size
+        movement = recent_avg - previous_avg
         velocity = abs(movement)
-        
+
         # Determine direction
         if movement < -self.min_movement:
             self.gesture.direction = ScrollDirection.UP

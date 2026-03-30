@@ -12,6 +12,9 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+from config import NUMBER_SELECTION
+from gestures.finger_counting import count_extended_fingers
+
 
 @dataclass
 class HandDetection:
@@ -166,13 +169,13 @@ class HandDetector:
         
         return detections
     
-    def get_finger_count(self, landmarks: np.ndarray) -> int:
+    def get_finger_count(self, landmarks: np.ndarray, handedness: str = "Unknown") -> int:
         """
         Count how many fingers are extended (open) in a hand.
         
         Algorithm:
-        - Thumb: Check if tip X is farther from wrist than PIP
-        - Other fingers: Check if tip Y is above PIP (higher up on frame)
+        - Thumb: Require clear outward motion based on handedness
+        - Other fingers: Require tip and middle joint to both sit above the base
         
         Args:
             landmarks: Hand landmarks (21 x 2 array, normalized 0-1)
@@ -182,20 +185,14 @@ class HandDetector:
         """
         if landmarks.size == 0:
             return 0
-        
-        count = 0
-        
-        # Thumb (check horizontal position)
-        if landmarks[self.LANDMARK_THUMB_TIP][0] < landmarks[self.FINGER_PIPS[0]][0]:
-            count += 1
-        
-        # Other four fingers (check vertical position)
-        for tip_idx, pip_idx in zip(self.FINGER_TIPS[1:], self.FINGER_PIPS[1:]):
-            # Finger is extended if tip is above (smaller Y) than PIP
-            if landmarks[tip_idx][1] < landmarks[pip_idx][1]:
-                count += 1
-        
-        return count
+
+        return count_extended_fingers(
+            landmarks,
+            handedness=handedness,
+            finger_tip_margin=NUMBER_SELECTION["finger_position_threshold"],
+            thumb_horizontal_margin=NUMBER_SELECTION["thumb_horizontal_margin"],
+            thumb_reach_margin=NUMBER_SELECTION["thumb_reach_margin"],
+        )
     
     def get_hand_center(self, landmarks: np.ndarray) -> Tuple[float, float]:
         """

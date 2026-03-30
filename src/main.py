@@ -172,6 +172,7 @@ class SideSwiperApp:
                 number_gesture = self.number_detector.detect(hand)
                 if number_gesture.is_confirmed:
                     print(f"→ Number {number_gesture.number} detected! Switching to Tab {number_gesture.number}")
+                    system_controller.goto_tab(number_gesture.number)
                     self.current_tab = number_gesture.number
                 
                 # Finger scroll detection

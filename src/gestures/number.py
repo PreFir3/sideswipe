@@ -58,7 +58,7 @@ class NumberDetector:
         self.confirmation_frames = 0
         self.last_confirmed_number = 0
         
-        # Lazy-load the finger counter function to avoid recreating HandDetector
+        # Lazy-load the finger counter to avoid recreating HandDetector every frame
         self._get_finger_count = None
     
     def detect(self, hand_detection) -> NumberGesture:
@@ -82,12 +82,23 @@ class NumberDetector:
             return gesture
         
         # Count fingers using landmark positions
-        from detectors.hand import HandDetector
-        detector = HandDetector()
-        finger_count = detector.get_finger_count(hand_detection.landmarks)
+        if self._get_finger_count is None:
+            from detectors.hand import HandDetector
+            detector = HandDetector()
+            self._get_finger_count = detector.get_finger_count
+
+        finger_count = self._get_finger_count(
+            hand_detection.landmarks,
+            handedness=hand_detection.handedness,
+        )
         
-        # Clamp to valid range
-        finger_count = max(self.min_fingers, min(self.max_fingers, finger_count))
+        # Treat 0 as "no number gesture" instead of forcing it to tab 1
+        finger_count = max(0, min(self.max_fingers, finger_count))
+        if finger_count == 0:
+            self.frame_history.clear()
+            self.current_number = 0
+            self.confirmation_frames = 0
+            return gesture
         
         # Add to history
         self.frame_history.append(finger_count)

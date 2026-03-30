@@ -26,7 +26,9 @@ except:
 # Add src directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import DETECTION
+from config import DETECTION, NUMBER_SELECTION, FINGER_SCROLL
+from gestures.finger_counting import count_extended_fingers
+from gestures.pinch_scroll import PinchScrollTracker
 
 
 class MacOSController:
@@ -151,19 +153,24 @@ class SimpleHandTracker:
         self.swipe_settle_threshold = 0.03  # Hand must be nearly still to re-arm
         self.swipe_prev_pos = {}  # Previous frame position for velocity check
 
-        # Scroll tracking - smooth velocity-based
-        self.scroll_start_pos = {}
-        self.scroll_threshold = 0.04  # Lower threshold for more responsive scrolling
+        # Scroll tracking - tuned to ignore jitter and ramp in smoothly
         self.scroll_cooldown = 0
         self.scroll_cooldown_time = 0.0  # No cooldown - continuous smooth scrolling
-        self.scroll_velocity = 0.0  # Current scroll velocity (smoothed)
-        self.scroll_velocity_smoothing = 0.6  # EMA factor for velocity smoothing
-        self.scroll_history = deque(maxlen=8)  # Position history for smooth velocity
+        self.scroll_tracker = PinchScrollTracker(
+            pinch_threshold=FINGER_SCROLL["pinch_threshold"],
+            activation_frames=FINGER_SCROLL["activation_frames"],
+            history_size=FINGER_SCROLL["history_size"],
+            velocity_smoothing=FINGER_SCROLL["velocity_smoothing"],
+            dead_zone=FINGER_SCROLL["dead_zone"],
+            velocity_scale=FINGER_SCROLL["velocity_scale"],
+            max_scroll_amount=FINGER_SCROLL["max_scroll_amount"],
+        )
 
         # Number gesture tracking (1-5 fingers → Chrome tab)
-        self.number_history = deque(maxlen=15)  # Stabilization buffer
+        self.number_stability_frames = max(8, NUMBER_SELECTION["stabilization_frames"] // 2)
+        self.number_history = deque(maxlen=self.number_stability_frames)
         self.number_cooldown = 0
-        self.number_cooldown_time = 1.5
+        self.number_cooldown_time = NUMBER_SELECTION["cooldown"]
         self.last_confirmed_number = 0
 
         print(f"✓ Camera initialized ({self.width}x{self.height})")
@@ -172,7 +179,7 @@ class SimpleHandTracker:
         print("  • 👆 POINT: Hover over tabs")
         print("  • 🔄 SWIPE: Change windows (left/right)")
         print("  • 📜 PINCH+DRAG: Scroll (up/down)")
-        print("  • ✋ 1-4 FINGERS: Jump to Chrome tab 1-4")
+        print("  • ✋ 1-5 FINGERS: Jump to Chrome tab 1-5")
         print("  • 'q': Quit\n")
     
     def detect_hands(self, frame):
@@ -307,87 +314,34 @@ class SimpleHandTracker:
         index_tip = landmarks[self.INDEX_TIP]
         thumb_tip = landmarks[self.THUMB_TIP]
 
-        thumb_index_distance = np.linalg.norm(thumb_tip - index_tip)
-        pinch_threshold = 0.05
-
-        if thumb_index_distance > pinch_threshold:
-            # Not pinching - reset scroll state
-            self.scroll_start_pos.pop(hand_id, None)
-            self.scroll_history.clear()
-            self.scroll_velocity = 0.0
+        scroll_update = self.scroll_tracker.update(hand_id, thumb_tip, index_tip)
+        if scroll_update is None:
             return None
 
-        # Pinch point midpoint
-        pinch_y = (index_tip[1] + thumb_tip[1]) / 2.0
+        return (scroll_update.direction, scroll_update.amount)
 
-        # Add to history for smoothing
-        self.scroll_history.append(pinch_y)
+    def count_fingers(self, hand):
+        """Count clearly extended fingers for tab navigation.
 
-        if len(self.scroll_history) < 3:
-            return None
-
-        # Compute smoothed velocity using weighted recent frames
-        # Compare average of last 3 frames vs previous 3 frames
-        recent = list(self.scroll_history)
-        n = len(recent)
-        if n >= 4:
-            new_avg = sum(recent[-2:]) / 2
-            old_avg = sum(recent[-4:-2]) / 2
-            raw_velocity = new_avg - old_avg
-        else:
-            raw_velocity = recent[-1] - recent[-2]
-
-        # Exponential moving average for smooth velocity
-        self.scroll_velocity = (self.scroll_velocity_smoothing * self.scroll_velocity
-                                + (1.0 - self.scroll_velocity_smoothing) * raw_velocity)
-
-        # Dead zone - ignore tiny movements
-        if abs(self.scroll_velocity) < 0.003:
-            return None
-
-        # Map velocity to scroll amount (1-8 lines per event)
-        # Larger finger movement = faster scroll
-        speed = abs(self.scroll_velocity)
-        scroll_amount = int(np.clip(speed * 200, 1, 8))
-
-        direction = "UP" if self.scroll_velocity < 0 else "DOWN"
-        return (direction, scroll_amount)
-    
-    def count_fingers(self, landmarks):
-        """Count number of extended fingers (1-5) for tab navigation.
-
-        Returns the finger count (0-5), where 0 means no clear number gesture.
-        Uses tip-vs-pip comparison for fingers and a special check for thumb.
+        Uses a stricter thumb rule so "2 fingers" and "3 fingers" land on the
+        matching numbered tab instead of drifting one tab higher.
         """
-        tips = [self.THUMB_TIP, self.INDEX_TIP, self.MIDDLE_TIP, self.RING_TIP, self.PINKY_TIP]
-        pips = [3, 6, 10, 14, 18]  # One joint below each tip
-
-        count = 0
-
-        # Thumb: compare x-distance from wrist (extended = tip farther from palm center)
-        wrist = landmarks[self.WRIST]
-        thumb_tip = landmarks[self.THUMB_TIP]
-        thumb_pip = landmarks[pips[0]]
-        # Thumb is extended if tip is farther from wrist than pip in x-axis
-        if abs(thumb_tip[0] - wrist[0]) > abs(thumb_pip[0] - wrist[0]):
-            count += 1
-
-        # Other 4 fingers: tip above pip (lower y = higher on screen)
-        for i in range(1, 5):
-            if landmarks[tips[i]][1] < landmarks[pips[i]][1]:
-                count += 1
-
-        return count
+        return count_extended_fingers(
+            hand["landmarks"],
+            handedness=hand.get("handedness", "Unknown"),
+            finger_tip_margin=NUMBER_SELECTION["finger_position_threshold"],
+            thumb_horizontal_margin=NUMBER_SELECTION["thumb_horizontal_margin"],
+            thumb_reach_margin=NUMBER_SELECTION["thumb_reach_margin"],
+        )
 
     def detect_number_gesture(self, hand):
-        """Detect stable finger count (1-4) for Chrome tab navigation.
+        """Detect stable finger count (1-5) for Chrome tab navigation.
 
-        Returns confirmed number (1-4) or None if no stable gesture detected.
+        Returns confirmed number (1-5) or None if no stable gesture detected.
         Requires consistent count over multiple frames to avoid jitter.
         Resets when hand returns to fist so the same tab can be re-selected.
         """
-        landmarks = hand['landmarks']
-        count = self.count_fingers(landmarks)
+        count = self.count_fingers(hand)
 
         # Fist (0 fingers) resets state so same tab can be triggered again
         if count == 0:
@@ -395,19 +349,19 @@ class SimpleHandTracker:
             self.last_confirmed_number = 0
             return None
 
-        # Only track 1-4
-        if count < 1 or count > 4:
+        # Only track 1-5
+        if count < 1 or count > 5:
             self.number_history.clear()
             return None
 
         self.number_history.append(count)
 
         # Need enough frames for stability
-        if len(self.number_history) < 10:
+        if len(self.number_history) < self.number_stability_frames:
             return None
 
-        # Check if last 10 frames are all the same number
-        recent = list(self.number_history)[-10:]
+        # Check if the recent window is stable
+        recent = list(self.number_history)[-self.number_stability_frames:]
         if all(n == recent[0] for n in recent):
             confirmed = recent[0]
             # Only fire if different from last confirmed (prevent repeats)
@@ -521,7 +475,7 @@ class SimpleHandTracker:
                     if self.is_active:
                         self.controller.scroll(scroll_dir, scroll_amount)
 
-                # Number gesture detection (1-4 fingers → Chrome tab 1-4)
+                # Number gesture detection (1-5 fingers → Chrome tab 1-5)
                 # Skip while hand is returning from a swipe to avoid false triggers
                 hand_id = hand['handedness']
                 if self.number_cooldown <= 0 and not self.swipe_returning.get(hand_id, False):

@@ -27,7 +27,9 @@ NUMBER_SELECTION = {
     "stabilization_frames": 20,         # frames - average finger count over this many frames (INCREASED)
     "confidence_threshold": 0.9,        # 0-1 - consistency required to trigger (MORE STRICT)
     "cooldown": 1.5,                    # seconds - between number changes (LONGER)
-    "finger_position_threshold": 0.02,  # normalized distance - tip must be above knuckle
+    "finger_position_threshold": 0.025, # normalized distance - raised fingers must clearly beat the knuckle
+    "thumb_horizontal_margin": 0.035,   # normalized distance - thumb must clearly point away from the hand
+    "thumb_reach_margin": 0.015,        # normalized distance - thumb tip must extend past the folded pose
 }
 
 # ============================================================================
@@ -62,9 +64,16 @@ OK_HAND = {
 
 FINGER_SCROLL = {
     "enabled": True,
-    "min_movement": 0.05,               # 0-1 normalized - minimum Y movement
-    "smoothing_frames": 5,              # frames for smoothing
-    "scroll_amount": 3,                 # pixels per scroll event
+    "min_movement": 0.035,              # 0-1 normalized - averaged movement needed before scrolling
+    "smoothing_frames": 7,              # frames for smoothing
+    "activation_frames": 4,             # frames - require a short stable gesture before scrolling
+    "dead_zone": 0.006,                 # 0-1 normalized - ignore tiny pinch movement jitter
+    "velocity_smoothing": 0.8,          # 0-1 - higher means smoother, less twitchy scrolling
+    "velocity_scale": 150,              # multiplier - maps gesture speed to scroll strength
+    "max_scroll_amount": 5,             # lines per event - cap for comfortable scrolling
+    "history_size": 8,                  # frames kept for smooth velocity estimation
+    "pinch_threshold": 0.05,            # 0-1 normalized - thumb/index distance for pinch scrolling
+    "scroll_amount": 2,                 # pixels per scroll event in the legacy runtime
 }
 
 # ============================================================================

@@ -59,6 +59,24 @@ class SystemController:
         except Exception as e:
             print(f"Error switching right tab: {e}")
             return False
+
+    def goto_tab(self, number: int) -> bool:
+        """Jump directly to a numbered browser tab."""
+        if not self._can_perform_action():
+            return False
+        if not 1 <= number <= 9:
+            return False
+        try:
+            if self.platform == "darwin":
+                self._run_applescript(
+                    f'tell application "System Events" to keystroke "{number}" using {{command down}}'
+                )
+            else:
+                subprocess.run(["xdotool", "key", f"alt+{number}"], check=False)
+            return True
+        except Exception as e:
+            print(f"Error going to tab {number}: {e}")
+            return False
     
     def scroll_up(self, amount: int = 3) -> bool:
         """Scroll up."""
