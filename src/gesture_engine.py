@@ -1,6 +1,6 @@
 """
 GestureEngine — all smoothing, orientation checks, and gesture state machines.
-Separated from rendering logic per architecture requirements.
+One instance per tracked hand. Separated from rendering logic.
 """
 
 import math
@@ -11,14 +11,10 @@ from typing import Optional
 
 
 class GestureEngine:
-    """Processes hand landmarks into gesture events.
+    """Processes one hand's landmarks into gesture events.
 
-    Responsibilities:
-      - Double exponential smoothing on raw landmarks
-      - Hand orientation detection (horizontal vs vertical)
-      - Swipe state machine: IDLE → CANDIDATE → CONFIRMED → COOLDOWN
-      - Finger-count state machine for tab navigation (1-4)
-      - Scroll momentum tracking
+    Create one instance per hand (Left / Right). Each instance owns its own
+    smoothing state and gesture state machines so two hands never interfere.
     """
 
     def __init__(self, alpha=0.12, beta=0.08):
@@ -37,20 +33,21 @@ class GestureEngine:
         self._hand_was_present = False
         self.partial_swipe_offset = 0.0
 
-        # Swipe thresholds
+        # Swipe thresholds — relaxed enough for real hands, strict enough to
+        # prevent accidental triggers
         self.HAND_ENTRY_COOLDOWN = 0.6   # 600 ms after hand enters frame
-        self.SWIPE_Y_SPREAD_MAX = 0.08   # max Y spread across 5 fingertips
-        self.SWIPE_ANGLE_TOL = 20        # degrees from horizontal
-        self.SWIPE_MIN_DISP = 0.12       # normalized displacement
-        self.SWIPE_MIN_VEL = 0.35        # normalized units / second
-        self.SWIPE_MAX_TIME = 0.4        # seconds to complete swipe
-        self.SWIPE_COOLDOWN = 0.6        # seconds after confirmed swipe
+        self.SWIPE_Y_SPREAD_MAX = 0.15   # max Y spread across 5 fingertips
+        self.SWIPE_ANGLE_TOL = 35        # degrees from horizontal
+        self.SWIPE_MIN_DISP = 0.10       # normalized horizontal displacement
+        self.SWIPE_MIN_VEL = 0.30        # normalized units / second
+        self.SWIPE_MAX_TIME = 0.6        # seconds to complete swipe motion
+        self.SWIPE_COOLDOWN = 0.8        # seconds after confirmed swipe
 
         # ── Finger count state ──
-        self._finger_history = deque(maxlen=12)
+        self._finger_history = deque(maxlen=8)
         self._last_confirmed = 0
         self._finger_cooldown_end = 0.0
-        self.FINGER_STABILITY = 12       # frames of consistent count
+        self.FINGER_STABILITY = 8        # frames (~0.27s at 30fps)
         self.FINGER_COOLDOWN = 0.8       # seconds between triggers
 
     # ──────────────────────────────────────────
@@ -73,8 +70,8 @@ class GestureEngine:
     #  Hand orientation helpers
     # ──────────────────────────────────────────
     def is_hand_horizontal(self, landmarks: np.ndarray) -> bool:
-        """True when all 5 fingertips sit in a tight horizontal band
-        AND the wrist→middle-MCP vector is near-horizontal."""
+        """True when fingertips are roughly in a horizontal band
+        AND the wrist-to-middle-MCP vector is near-horizontal."""
         tip_ys = [landmarks[i][1] for i in (4, 8, 12, 16, 20)]
         if max(tip_ys) - min(tip_ys) > self.SWIPE_Y_SPREAD_MAX:
             return False
@@ -85,15 +82,17 @@ class GestureEngine:
         return angle < self.SWIPE_ANGLE_TOL or angle > (180 - self.SWIPE_ANGLE_TOL)
 
     def is_hand_vertical(self, landmarks: np.ndarray) -> bool:
-        """True when wrist is below all non-thumb tips and vector is ~vertical."""
+        """True when wrist is below the non-thumb fingertips (hand held upright)."""
         wrist_y = landmarks[0][1]
-        if not all(landmarks[i][1] < wrist_y for i in (8, 12, 16, 20)):
+        # At least 3 of 4 fingertips must be above the wrist
+        tips_above = sum(1 for i in (8, 12, 16, 20) if landmarks[i][1] < wrist_y)
+        if tips_above < 3:
             return False
 
         wrist = landmarks[0]
         mcp9 = landmarks[9]
         angle = math.atan2(mcp9[1] - wrist[1], mcp9[0] - wrist[0]) * 180 / math.pi
-        return abs(angle + 90) < 30
+        return abs(angle + 90) < 45  # 45° tolerance
 
     # ──────────────────────────────────────────
     #  Swipe state machine
@@ -101,9 +100,7 @@ class GestureEngine:
     def process_swipe(self, landmarks: np.ndarray) -> Optional[str]:
         """Returns 'LEFT', 'RIGHT', or None.
 
-        State machine: IDLE → CANDIDATE → CONFIRMED → COOLDOWN
-        Only fires when hand is horizontal, displacement and velocity exceed
-        thresholds, and the 600 ms hand-entry cooldown has elapsed.
+        State machine: IDLE -> CANDIDATE -> CONFIRMED -> COOLDOWN
         """
         now = time.time()
 
@@ -133,7 +130,7 @@ class GestureEngine:
 
         palm_x = (landmarks[0][0] + landmarks[9][0]) / 2
 
-        # IDLE → CANDIDATE
+        # IDLE -> CANDIDATE
         if self.swipe_state == 'IDLE':
             self._swipe_start_x = palm_x
             self._swipe_start_time = now
@@ -141,7 +138,7 @@ class GestureEngine:
             self.partial_swipe_offset = 0
             return None
 
-        # CANDIDATE → check for CONFIRMED
+        # CANDIDATE -> check for CONFIRMED
         if self.swipe_state == 'CANDIDATE':
             disp = palm_x - self._swipe_start_x
             elapsed = now - self._swipe_start_time
