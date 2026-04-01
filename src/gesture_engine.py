@@ -7,6 +7,7 @@ import math
 import time
 import numpy as np
 from collections import deque
+from typing import Optional
 
 
 class GestureEngine:
@@ -97,7 +98,7 @@ class GestureEngine:
     # ──────────────────────────────────────────
     #  Swipe state machine
     # ──────────────────────────────────────────
-    def process_swipe(self, landmarks: np.ndarray) -> str | None:
+    def process_swipe(self, landmarks: np.ndarray) -> Optional[str]:
         """Returns 'LEFT', 'RIGHT', or None.
 
         State machine: IDLE → CANDIDATE → CONFIRMED → COOLDOWN
@@ -167,7 +168,7 @@ class GestureEngine:
     # ──────────────────────────────────────────
     #  Finger count (tab navigation)
     # ──────────────────────────────────────────
-    def process_finger_count(self, count: int) -> int | None:
+    def process_finger_count(self, count: int) -> Optional[int]:
         """Feed a finger count each frame. Returns confirmed tab (1-4) or None.
 
         Caller must verify hand is vertical before calling.
