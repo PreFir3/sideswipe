@@ -104,6 +104,37 @@ EYE_GAZE = {
 }
 
 # ============================================================================
+# FACEMESH (Blink / Mouth / Head Tilt / Eyebrow)
+# ============================================================================
+
+FACEMESH = {
+    "enabled": True,
+    "ear_blink_threshold": 0.22,        # EAR below this = eye closed
+    "mouth_open_threshold": 0.06,       # mouth-gap / face-height ratio
+    "brow_raise_threshold": 0.28,       # brow-eye / face-height ratio
+    "smooth_alpha": 0.3,                # EMA smoothing factor for all metrics
+    "double_blink_window": 0.4,         # seconds — window for double-blink detection
+}
+
+# ============================================================================
+# GESTURE ENGINE (Smoothing & State Machine)
+# ============================================================================
+
+GESTURE_ENGINE = {
+    "smooth_alpha": 0.12,               # position smoothing (double exponential)
+    "smooth_beta": 0.08,                # velocity smoothing (double exponential)
+    "hand_entry_cooldown": 0.6,         # seconds — ignore gestures after hand enters frame
+    "swipe_y_spread_max": 0.08,         # max Y spread of 5 fingertips for horizontal check
+    "swipe_angle_tolerance": 20,        # degrees from horizontal
+    "swipe_min_displacement": 0.12,     # normalized horizontal displacement
+    "swipe_min_velocity": 0.35,         # normalized units / second
+    "swipe_max_time": 0.4,             # seconds to complete swipe motion
+    "swipe_cooldown": 0.6,             # seconds after confirmed swipe
+    "finger_stability_frames": 12,      # frames of consistent count before confirming
+    "finger_cooldown": 0.8,            # seconds between tab switches
+}
+
+# ============================================================================
 # DETECTION & PROCESSING
 # ============================================================================
 
@@ -182,6 +213,8 @@ def get_config():
         "clap_activation": CLAP_ACTIVATION,
         "head_tilt": HEAD_TILT,
         "eye_gaze": EYE_GAZE,
+        "facemesh": FACEMESH,
+        "gesture_engine": GESTURE_ENGINE,
         "detection": DETECTION,
         "visualization": VISUALIZATION,
         "system": SYSTEM,

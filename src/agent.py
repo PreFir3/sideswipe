@@ -1,6 +1,7 @@
 """
 Sideswipe - Hand Gesture Tracking Agent
-Stable hand tracking with native macOS automation
+Enhanced with double-exponential smoothing, strict swipe gating,
+FaceMesh integration, and gesture state machines.
 """
 
 import cv2
@@ -13,15 +14,6 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import subprocess
-import os
-
-# Use PyObjC for native macOS scrolling
-try:
-    from AppKit import NSEvent, NSApplication
-    from Cocoa import NSEventTypeScrollWheel
-    NATIVE_SCROLL_AVAILABLE = True
-except:
-    NATIVE_SCROLL_AVAILABLE = False
 
 # Add src directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -29,13 +21,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import DETECTION, NUMBER_SELECTION, FINGER_SCROLL
 from gestures.finger_counting import count_extended_fingers
 from gestures.pinch_scroll import PinchScrollTracker
+from gesture_engine import GestureEngine
+from face_engine import FaceEngine
 
 
 class MacOSController:
     """Native macOS automation using pynput for smooth scrolling."""
 
     def __init__(self):
-        # Initialize pynput mouse controller once for smooth scrolling
         try:
             from pynput.mouse import Controller as MouseController
             self.mouse = MouseController()
@@ -43,7 +36,7 @@ class MacOSController:
             self.mouse = None
 
     def scroll(self, direction, amount=2):
-        """Scroll using pynput mouse wheel for smooth, controllable scrolling."""
+        """Scroll using pynput mouse wheel."""
         try:
             if self.mouse:
                 dy = amount if direction == "UP" else -amount
@@ -73,7 +66,7 @@ class MacOSController:
 
     @staticmethod
     def goto_tab(number):
-        """Navigate to a specific Chrome tab (1-9) using Cmd+Number."""
+        """Navigate to a specific Chrome tab (1-4) using Cmd+Number."""
         try:
             script = f'''
             tell application "System Events"
@@ -86,26 +79,31 @@ class MacOSController:
 
 
 class SimpleHandTracker:
+    """Hand + face tracking with strict gesture gating.
+
+    Architecture:
+      - GestureEngine handles all smoothing and gesture state machines
+      - FaceEngine handles FaceMesh metric extraction
+      - This class owns the camera, MediaPipe models, and rendering
     """
-    Stable hand tracking with MediaPipe.
-    Tracks hands at any angle with gesture recognition.
-    """
-    
-    # Landmark indices
+
     WRIST = 0
     THUMB_TIP = 4
     INDEX_TIP = 8
     MIDDLE_TIP = 12
     RING_TIP = 16
     PINKY_TIP = 20
-    
+
     def __init__(self):
-        """Initialize hand tracker with optimal MediaPipe settings."""
-        print("🤖 Initializing Hand Tracker...")
-        
-        # Initialize MediaPipe hand detector
+        print("Initializing Hand + Face Tracker...")
+
+        # ── Engines ──
+        self.gesture_engine = GestureEngine(alpha=0.12, beta=0.08)
+        self.face_engine = FaceEngine()
+        self.controller = MacOSController()
+
+        # ── MediaPipe Hands (Tasks API) ──
         model_path = "hand_landmarker.task"
-        
         try:
             base_options = python.BaseOptions(model_asset_path=model_path)
             options = vision.HandLandmarkerOptions(
@@ -113,49 +111,46 @@ class SimpleHandTracker:
                 num_hands=2,
                 min_hand_detection_confidence=0.6,
                 min_hand_presence_confidence=0.6,
-                min_tracking_confidence=0.5
+                min_tracking_confidence=0.5,
             )
             self.hands = vision.HandLandmarker.create_from_options(options)
-            print("✓ Hand detector initialized")
+            print("  Hand detector ready")
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize hand detector: {e}")
-        
-        # Initialize macOS controller
-        self.controller = MacOSController()
-        print("✓ macOS control initialized")
+            raise RuntimeError(f"Failed to init hand detector: {e}")
 
-        # Camera setup
+        # ── MediaPipe FaceMesh (Solutions API) ──
+        try:
+            mp_face = mp.solutions.face_mesh
+            self.face_mesh = mp_face.FaceMesh(
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            print("  FaceMesh ready")
+        except Exception as e:
+            print(f"  FaceMesh unavailable: {e}")
+            self.face_mesh = None
+
+        # ── Camera ──
         self.cap = cv2.VideoCapture(0)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, DETECTION["resolution_width"])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DETECTION["resolution_height"])
         self.cap.set(cv2.CAP_PROP_FPS, DETECTION["frame_rate"])
 
         if not self.cap.isOpened():
-            raise RuntimeError("❌ Cannot access camera")
+            raise RuntimeError("Cannot access camera")
 
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"  Camera {self.width}x{self.height}")
 
-        # Gesture tracking state
+        # ── Activation ──
         self.is_active = False
-        self.clap_history = deque(maxlen=3)  # Track last 3 hand distances
-        self.clap_threshold = 0.15  # Distance between hands for clap detection
+        self.clap_history = deque(maxlen=3)
         self.clap_cooldown = 0
-        self.clap_cooldown_time = 0.5
 
-        # Swipe tracking - with return-to-neutral logic
-        self.swipe_start_pos = {}  # Track start position per hand
-        self.swipe_threshold = 0.15  # Minimum swipe distance
-        self.swipe_cooldown = 0
-        self.swipe_cooldown_time = 1.0  # 1 second cooldown between swipes
-        self.swipe_neutral_pos = {}  # Where hand was when swipe fired
-        self.swipe_returning = {}  # True while hand is returning to neutral
-        self.swipe_settle_threshold = 0.03  # Hand must be nearly still to re-arm
-        self.swipe_prev_pos = {}  # Previous frame position for velocity check
-
-        # Scroll tracking - tuned to ignore jitter and ramp in smoothly
-        self.scroll_cooldown = 0
-        self.scroll_cooldown_time = 0.0  # No cooldown - continuous smooth scrolling
+        # ── Scroll (pinch) ──
         self.scroll_tracker = PinchScrollTracker(
             pinch_threshold=FINGER_SCROLL["pinch_threshold"],
             activation_frames=FINGER_SCROLL["activation_frames"],
@@ -166,356 +161,278 @@ class SimpleHandTracker:
             max_scroll_amount=FINGER_SCROLL["max_scroll_amount"],
         )
 
-        # Number gesture tracking (1-5 fingers → Chrome tab)
-        self.number_stability_frames = max(8, NUMBER_SELECTION["stabilization_frames"] // 2)
-        self.number_history = deque(maxlen=self.number_stability_frames)
-        self.number_cooldown = 0
-        self.number_cooldown_time = NUMBER_SELECTION["cooldown"]
-        self.last_confirmed_number = 0
+        # ── Per-frame state ──
+        self.hand_was_present = False
+        self.face_metrics = None
 
-        print(f"✓ Camera initialized ({self.width}x{self.height})")
-        print("\n📋 CONTROLS:")
-        print("  • 👏 CLAP TWICE: Toggle on/off")
-        print("  • 👆 POINT: Hover over tabs")
-        print("  • 🔄 SWIPE: Change windows (left/right)")
-        print("  • 📜 PINCH+DRAG: Scroll (up/down)")
-        print("  • ✋ 1-5 FINGERS: Jump to Chrome tab 1-5")
-        print("  • 'q': Quit\n")
-    
+        print("\nCONTROLS:")
+        print("  CLAP TWICE     : Toggle on/off")
+        print("  FLAT HAND SWIPE: Switch tabs (left/right)")
+        print("  PINCH + DRAG   : Scroll (up/down)")
+        print("  HOLD 1-4 (vertical): Jump to Chrome tab 1-4")
+        print("  'q'            : Quit\n")
+
+    # ──────────────────────────────────────────
+    #  Hand detection
+    # ──────────────────────────────────────────
     def detect_hands(self, frame):
-        """Detect hands in frame."""
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         results = self.hands.detect(mp_image)
-        
+
         hands = []
         if results.hand_landmarks:
             for i, hand_landmarks in enumerate(results.hand_landmarks):
-                landmarks = np.array([
-                    [lm.x, lm.y] for lm in hand_landmarks
-                ])
-                
-                # Get handedness safely
+                landmarks = np.array([[lm.x, lm.y] for lm in hand_landmarks])
+
                 handedness_name = "Unknown"
                 confidence = 0.0
                 if results.handedness and i < len(results.handedness):
-                    hand_info = results.handedness[i]
-                    if hasattr(hand_info, '__iter__') and len(hand_info) > 0:
-                        handedness_name = hand_info[0].category_name
-                        confidence = hand_info[0].score
-                    elif hasattr(hand_info, 'category_name'):
-                        handedness_name = hand_info.category_name
-                        confidence = hand_info.score
-                
+                    info = results.handedness[i]
+                    if hasattr(info, '__iter__') and len(info) > 0:
+                        handedness_name = info[0].category_name
+                        confidence = info[0].score
+                    elif hasattr(info, 'category_name'):
+                        handedness_name = info.category_name
+                        confidence = info.score
+
                 hands.append({
                     'landmarks': landmarks,
                     'handedness': handedness_name,
-                    'confidence': confidence
+                    'confidence': confidence,
                 })
-        
         return hands
-    
+
+    # ──────────────────────────────────────────
+    #  Face detection
+    # ──────────────────────────────────────────
+    def detect_face(self, frame):
+        """Run FaceMesh and update face_engine metrics."""
+        if self.face_mesh is None:
+            return None
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = self.face_mesh.process(rgb)
+
+        if results.multi_face_landmarks:
+            face_lm = results.multi_face_landmarks[0].landmark
+            self.face_metrics = self.face_engine.process(face_lm)
+            return self.face_metrics
+        return None
+
+    # ──────────────────────────────────────────
+    #  Gesture helpers (delegated)
+    # ──────────────────────────────────────────
     def get_hand_center(self, landmarks):
-        """Get center of hand (palm area)."""
-        palm_landmarks = landmarks[5:10]
-        center_x = np.mean(palm_landmarks[:, 0])
-        center_y = np.mean(palm_landmarks[:, 1])
-        return np.array([center_x, center_y])
-    
+        return np.mean(landmarks[5:10], axis=0)
+
     def detect_clap(self, hands):
-        """Detect clap gesture (two hands close together)."""
         if len(hands) < 2:
             return False
-        
-        center1 = self.get_hand_center(hands[0]['landmarks'])
-        center2 = self.get_hand_center(hands[1]['landmarks'])
-        distance = np.linalg.norm(center1 - center2)
-        
-        self.clap_history.append(distance)
-        
-        # Detect clap: distance decreases then increases (hands clapping)
+        c1 = self.get_hand_center(hands[0]['landmarks'])
+        c2 = self.get_hand_center(hands[1]['landmarks'])
+        dist = np.linalg.norm(c1 - c2)
+        self.clap_history.append(dist)
         if len(self.clap_history) >= 3:
-            prev_dist = self.clap_history[-3]
-            curr_dist = self.clap_history[-1]
-            
-            # If distance is small and was decreasing
-            if curr_dist < self.clap_threshold and prev_dist > curr_dist:
+            if self.clap_history[-1] < 0.15 and self.clap_history[-3] > self.clap_history[-1]:
                 return True
-        
         return False
-    
-    def detect_swipe(self, hand):
-        """Detect swipe gesture with return-to-neutral logic.
-
-        After a swipe fires, the detector enters a 'returning' state where it
-        ignores hand movement until the hand settles (stops moving). This prevents
-        the hand drifting back to center from triggering a reverse swipe.
-        """
-        hand_id = hand['handedness']
-        landmarks = hand['landmarks']
-        center = self.get_hand_center(landmarks)
-
-        # Check if we're pinching - if so, don't swipe
-        thumb_tip = landmarks[self.THUMB_TIP]
-        index_tip = landmarks[self.INDEX_TIP]
-        thumb_index_distance = np.linalg.norm(thumb_tip - index_tip)
-
-        if thumb_index_distance < 0.06:  # If pinching, don't swipe
-            self.swipe_start_pos.pop(hand_id, None)
-            self.swipe_returning.pop(hand_id, None)
-            self.swipe_prev_pos.pop(hand_id, None)
-            return None
-
-        # Calculate hand velocity (frame-to-frame movement)
-        prev = self.swipe_prev_pos.get(hand_id)
-        self.swipe_prev_pos[hand_id] = center.copy()
-        if prev is None:
-            return None
-        frame_velocity = np.linalg.norm(center - prev)
-
-        # RETURN-TO-NEUTRAL PHASE: after a swipe, wait for hand to settle
-        if self.swipe_returning.get(hand_id, False):
-            # Hand is settled when it's barely moving
-            if frame_velocity < self.swipe_settle_threshold:
-                # Hand is still - re-arm the detector
-                self.swipe_returning[hand_id] = False
-                self.swipe_start_pos[hand_id] = center.copy()
-            # Still returning - don't detect any swipe
-            return None
-
-        # Normal swipe detection
-        if hand_id not in self.swipe_start_pos:
-            self.swipe_start_pos[hand_id] = center.copy()
-            return None
-
-        start = self.swipe_start_pos[hand_id]
-        delta_x = center[0] - start[0]
-        delta_y = center[1] - start[1]
-
-        if abs(delta_x) > 0.1 and abs(delta_y) < 0.08:
-            direction = "LEFT" if delta_x < -0.1 else "RIGHT"
-            # Enter return-to-neutral phase instead of immediately re-arming
-            self.swipe_returning[hand_id] = True
-            self.swipe_start_pos.pop(hand_id, None)
-            return direction
-
-        return None
-    
-    def detect_two_finger_scroll(self, hand):
-        """Detect scroll gesture with smooth velocity-proportional output.
-
-        Returns (direction, scroll_amount) tuple or None.
-        The scroll amount scales with how fast/far you move your pinched fingers,
-        giving fine-grained control and smooth visual scrolling.
-        """
-        hand_id = hand['handedness']
-        landmarks = hand['landmarks']
-
-        index_tip = landmarks[self.INDEX_TIP]
-        thumb_tip = landmarks[self.THUMB_TIP]
-
-        scroll_update = self.scroll_tracker.update(hand_id, thumb_tip, index_tip)
-        if scroll_update is None:
-            return None
-
-        return (scroll_update.direction, scroll_update.amount)
 
     def count_fingers(self, hand):
-        """Count clearly extended fingers for tab navigation.
-
-        Uses a stricter thumb rule so "2 fingers" and "3 fingers" land on the
-        matching numbered tab instead of drifting one tab higher.
-        """
         return count_extended_fingers(
-            hand["landmarks"],
-            handedness=hand.get("handedness", "Unknown"),
+            hand['landmarks'],
+            handedness=hand.get('handedness', 'Unknown'),
             finger_tip_margin=NUMBER_SELECTION["finger_position_threshold"],
             thumb_horizontal_margin=NUMBER_SELECTION["thumb_horizontal_margin"],
             thumb_reach_margin=NUMBER_SELECTION["thumb_reach_margin"],
         )
 
-    def detect_number_gesture(self, hand):
-        """Detect stable finger count (1-5) for Chrome tab navigation.
-
-        Returns confirmed number (1-5) or None if no stable gesture detected.
-        Requires consistent count over multiple frames to avoid jitter.
-        Resets when hand returns to fist so the same tab can be re-selected.
-        """
-        count = self.count_fingers(hand)
-
-        # Fist (0 fingers) resets state so same tab can be triggered again
-        if count == 0:
-            self.number_history.clear()
-            self.last_confirmed_number = 0
-            return None
-
-        # Only track 1-5
-        if count < 1 or count > 5:
-            self.number_history.clear()
-            return None
-
-        self.number_history.append(count)
-
-        # Need enough frames for stability
-        if len(self.number_history) < self.number_stability_frames:
-            return None
-
-        # Check if the recent window is stable
-        recent = list(self.number_history)[-self.number_stability_frames:]
-        if all(n == recent[0] for n in recent):
-            confirmed = recent[0]
-            # Only fire if different from last confirmed (prevent repeats)
-            if confirmed != self.last_confirmed_number:
-                self.last_confirmed_number = confirmed
-                self.number_history.clear()
-                return confirmed
-
-        return None
-
-    def detect_pointing(self, landmarks):
-        """Detect pointing gesture (index finger extended)."""
-        index_tip = landmarks[self.INDEX_TIP]
-        index_pip = landmarks[6]
-        middle_tip = landmarks[self.MIDDLE_TIP]
-        middle_pip = landmarks[10]
-        
-        # Index extended, middle not extended
-        index_extended = index_tip[1] < index_pip[1]
-        middle_not_extended = middle_tip[1] > middle_pip[1]
-        
-        return index_extended and middle_not_extended
-    
-    def draw_hand(self, frame, hand):
-        """Draw hand landmarks on frame."""
+    def detect_pinch_scroll(self, hand):
+        hand_id = hand['handedness']
         landmarks = hand['landmarks']
+        update = self.scroll_tracker.update(
+            hand_id, landmarks[self.THUMB_TIP], landmarks[self.INDEX_TIP]
+        )
+        if update is None:
+            return None
+        return (update.direction, update.amount)
+
+    # ──────────────────────────────────────────
+    #  Drawing
+    # ──────────────────────────────────────────
+    def draw_hand(self, frame, landmarks):
         h, w = frame.shape[:2]
-        
-        # Draw connections
         connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4),
-            (0, 5), (5, 6), (6, 7), (7, 8),
-            (0, 9), (9, 10), (10, 11), (11, 12),
-            (0, 13), (13, 14), (14, 15), (15, 16),
-            (0, 17), (17, 18), (18, 19), (19, 20),
-            (5, 9), (9, 13), (13, 17)
+            (0,1),(1,2),(2,3),(3,4),
+            (0,5),(5,6),(6,7),(7,8),
+            (0,9),(9,10),(10,11),(11,12),
+            (0,13),(13,14),(14,15),(15,16),
+            (0,17),(17,18),(18,19),(19,20),
+            (5,9),(9,13),(13,17),
         ]
-        
-        for start, end in connections:
-            x1, y1 = int(landmarks[start][0] * w), int(landmarks[start][1] * h)
-            x2, y2 = int(landmarks[end][0] * w), int(landmarks[end][1] * h)
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        
-        # Draw landmarks
-        for i, (x, y) in enumerate(landmarks):
-            px, py = int(x * w), int(y * h)
-            if i == 8:
-                color = (0, 255, 255)  # Cyan - Index
-            elif i == 12:
-                color = (255, 0, 255)  # Magenta - Middle
-            elif i == 4:
-                color = (0, 255, 0)   # Green - Thumb
-            else:
-                color = (255, 0, 0)   # Blue
-            
+        for a, b in connections:
+            p1 = (int(landmarks[a][0]*w), int(landmarks[a][1]*h))
+            p2 = (int(landmarks[b][0]*w), int(landmarks[b][1]*h))
+            cv2.line(frame, p1, p2, (0, 255, 0), 2)
+
+        for i in range(21):
+            px = int(landmarks[i][0]*w)
+            py = int(landmarks[i][1]*h)
+            color = {4:(0,255,0), 8:(0,255,255), 12:(255,0,255)}.get(i, (255,0,0))
             cv2.circle(frame, (px, py), 4, color, -1)
-    
+
+    def draw_face_hud(self, frame):
+        """Draw a small face-metrics HUD in the top-left corner."""
+        if self.face_metrics is None:
+            return
+
+        m = self.face_metrics
+        x0, y0 = 10, 10
+        lh = 20  # line height
+        bg_h = lh * 7 + 10
+        bg_w = 260
+
+        # Semi-transparent background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + bg_w, y0 + bg_h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        def put(line, text, color=(200, 200, 200)):
+            cv2.putText(frame, text, (x0 + 8, y0 + 18 + line * lh),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        put(0, "FACEMESH", (0, 200, 255))
+
+        blink_l = "BLINK" if m['blink_left'] else ""
+        blink_r = "BLINK" if m['blink_right'] else ""
+        put(1, f"L Eye: {m['ear_left']:.2f} {blink_l}",
+            (0, 0, 255) if m['blink_left'] else (200, 200, 200))
+        put(2, f"R Eye: {m['ear_right']:.2f} {blink_r}",
+            (0, 0, 255) if m['blink_right'] else (200, 200, 200))
+
+        mouth_s = "OPEN" if m['mouth_open'] else ""
+        put(3, f"Mouth: {m['mouth_openness']:.2f} {mouth_s}",
+            (0, 255, 0) if m['mouth_open'] else (200, 200, 200))
+
+        put(4, f"Tilt:  {m['head_tilt']:.1f} deg")
+
+        brow_s = "RAISED" if m['brow_raised'] else ""
+        put(5, f"Brows: {m['brow_raise']:.2f} {brow_s}",
+            (0, 255, 0) if m['brow_raised'] else (200, 200, 200))
+
+    # ──────────────────────────────────────────
+    #  Main loop
+    # ──────────────────────────────────────────
     def run(self):
-        """Main loop - track and display hands."""
-        print("🎥 Hand tracking started...\n")
-        
+        print("Hand + face tracking started...\n")
+
         frame_count = 0
         fps_time = time.time()
-        
+
         while True:
             ret, frame = self.cap.read()
             if not ret:
                 print("Failed to read frame")
                 break
-            
-            frame_count += 1
-            
-            # Update cooldowns
-            self.clap_cooldown = max(0, self.clap_cooldown - 1/30)
-            self.swipe_cooldown = max(0, self.swipe_cooldown - 1/30)
-            self.scroll_cooldown = max(0, self.scroll_cooldown - 1/30)
-            self.number_cooldown = max(0, self.number_cooldown - 1/30)
-            
-            # Detect hands
-            hands = self.detect_hands(frame)
-            
-            # Draw hands
-            for hand in hands:
-                self.draw_hand(frame, hand)
-            
-            # Gesture detection
-            if len(hands) >= 2:
-                # Clap detection
-                if self.clap_cooldown <= 0 and self.detect_clap(hands):
-                    self.is_active = not self.is_active
-                    status = "✓ ACTIVATED" if self.is_active else "✗ DEACTIVATED"
-                    print(f"👏 CLAP DETECTED → {status}")
-                    self.clap_cooldown = self.clap_cooldown_time
-            
-            # Single hand gestures
-            for hand in hands:
-                # Swipe detection
-                if self.swipe_cooldown <= 0:
-                    swipe_dir = self.detect_swipe(hand)
-                    if swipe_dir:
-                        print(f"🔄 SWIPE {swipe_dir}")
-                        if self.is_active:
-                            self.controller.switch_tab(swipe_dir)
-                            time.sleep(0.1)
-                        self.swipe_cooldown = self.swipe_cooldown_time
-                
-                # Scroll detection (smooth, velocity-proportional)
-                scroll_result = self.detect_two_finger_scroll(hand)
-                if scroll_result:
-                    scroll_dir, scroll_amount = scroll_result
-                    if self.is_active:
-                        self.controller.scroll(scroll_dir, scroll_amount)
 
-                # Number gesture detection (1-5 fingers → Chrome tab 1-5)
-                # Skip while hand is returning from a swipe to avoid false triggers
-                hand_id = hand['handedness']
-                if self.number_cooldown <= 0 and not self.swipe_returning.get(hand_id, False):
-                    number = self.detect_number_gesture(hand)
-                    if number is not None:
-                        print(f"✋ {number} FINGER{'S' if number > 1 else ''} → Tab {number}")
+            frame_count += 1
+            dt = 1 / 30
+            self.clap_cooldown = max(0, self.clap_cooldown - dt)
+
+            # ── Detect hands ──
+            hands = self.detect_hands(frame)
+
+            # ── Detect face (runs in parallel with hand processing) ──
+            self.detect_face(frame)
+
+            # ── Process hands ──
+            hand_present = len(hands) > 0
+
+            if not hand_present and self.hand_was_present:
+                self.gesture_engine.on_hand_lost()
+            self.hand_was_present = hand_present
+
+            # ── Clap detection (2 hands) ──
+            if len(hands) >= 2 and self.clap_cooldown <= 0:
+                if self.detect_clap(hands):
+                    self.is_active = not self.is_active
+                    status = "ACTIVATED" if self.is_active else "DEACTIVATED"
+                    print(f"CLAP -> {status}")
+                    self.clap_cooldown = 0.5
+
+            # ── Single-hand gestures ──
+            for hand in hands:
+                raw_lm = hand['landmarks']
+
+                # Smooth landmarks through GestureEngine
+                smoothed = self.gesture_engine.smooth(raw_lm)
+
+                # Draw smoothed skeleton
+                self.draw_hand(frame, smoothed)
+
+                # ── SWIPE (horizontal hand only) ──
+                swipe_dir = self.gesture_engine.process_swipe(smoothed)
+                if swipe_dir:
+                    print(f"SWIPE {swipe_dir} [{self.gesture_engine.swipe_state}]")
+                    if self.is_active:
+                        self.controller.switch_tab(swipe_dir)
+
+                # ── FINGER COUNT (vertical hand only) ──
+                if self.gesture_engine.is_hand_vertical(smoothed):
+                    count = self.count_fingers(hand)
+                    tab = self.gesture_engine.process_finger_count(count)
+                    if tab is not None:
+                        print(f"{tab} FINGER{'S' if tab > 1 else ''} -> Tab {tab}")
                         if self.is_active:
-                            self.controller.goto_tab(number)
-                        self.number_cooldown = self.number_cooldown_time
-            
-            # Display status
-            status_text = "🟢 ACTIVE" if self.is_active else "🔴 INACTIVE"
+                            self.controller.goto_tab(tab)
+
+                # ── PINCH SCROLL ──
+                scroll = self.detect_pinch_scroll(hand)
+                if scroll:
+                    scroll_dir, scroll_amt = scroll
+                    if self.is_active:
+                        self.controller.scroll(scroll_dir, scroll_amt)
+
+            # ── Face HUD overlay ──
+            self.draw_face_hud(frame)
+
+            # ── Blink event (double-blink wired as example action) ──
+            blinks = self.face_engine.consume_blink_event()
+            if blinks >= 2:
+                print("DOUBLE BLINK detected")
+
+            # ── Status display ──
+            status_text = "ACTIVE" if self.is_active else "INACTIVE"
             status_color = (0, 255, 0) if self.is_active else (0, 0, 255)
-            cv2.putText(frame, status_text, (self.width - 200, 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
-            
-            # Display hand count
-            if len(hands) > 0:
-                cv2.putText(frame, f"Hands: {len(hands)}", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                           1, (0, 255, 0), 2)
-            
-            # Calculate FPS
+            cv2.putText(frame, status_text, (self.width - 180, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+
+            swipe_st = self.gesture_engine.swipe_state
+            cv2.putText(frame, f"Swipe: {swipe_st}", (self.width - 220, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+            if hands:
+                cv2.putText(frame, f"Hands: {len(hands)}", (10, self.height - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+
+            # ── FPS ──
             if frame_count % 30 == 0:
                 elapsed = time.time() - fps_time
-                fps = 30 / elapsed
-                print(f"FPS: {fps:.1f} | Hands: {len(hands)} | Status: {'🟢 ACTIVE' if self.is_active else '🔴 INACTIVE'}")
+                fps = 30 / max(elapsed, 0.001)
+                print(f"FPS: {fps:.1f} | Hands: {len(hands)} | {'ACTIVE' if self.is_active else 'INACTIVE'}")
                 fps_time = time.time()
-            
-            # Display frame
-            cv2.imshow("Hand Tracking", frame)
-            
-            # Check for quit
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+
+            cv2.imshow("Sideswipe", frame)
+
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
-        
+
         self.cap.release()
         cv2.destroyAllWindows()
-        print("\n✓ Tracking stopped")
+        if self.face_mesh:
+            self.face_mesh.close()
+        print("\nTracking stopped")
 
 
 if __name__ == "__main__":
@@ -523,7 +440,7 @@ if __name__ == "__main__":
         tracker = SimpleHandTracker()
         tracker.run()
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
