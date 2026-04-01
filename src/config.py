@@ -66,13 +66,13 @@ FINGER_SCROLL = {
     "enabled": True,
     "min_movement": 0.035,              # 0-1 normalized - averaged movement needed before scrolling
     "smoothing_frames": 7,              # frames for smoothing
-    "activation_frames": 4,             # frames - require a short stable gesture before scrolling
-    "dead_zone": 0.006,                 # 0-1 normalized - ignore tiny pinch movement jitter
-    "velocity_smoothing": 0.8,          # 0-1 - higher means smoother, less twitchy scrolling
-    "velocity_scale": 150,              # multiplier - maps gesture speed to scroll strength
-    "max_scroll_amount": 5,             # lines per event - cap for comfortable scrolling
-    "history_size": 8,                  # frames kept for smooth velocity estimation
-    "pinch_threshold": 0.05,            # 0-1 normalized - thumb/index distance for pinch scrolling
+    "activation_frames": 3,             # frames - fewer = faster scroll start
+    "dead_zone": 0.004,                 # 0-1 normalized - lower = smoother continuous scroll
+    "velocity_smoothing": 0.6,          # 0-1 - lower = more responsive to speed changes
+    "velocity_scale": 200,              # multiplier - higher = more scroll per movement
+    "max_scroll_amount": 8,             # lines per event - higher cap for fast scrolling
+    "history_size": 10,                 # frames kept for smooth velocity estimation
+    "pinch_threshold": 0.07,            # 0-1 normalized - easier to enter pinch mode
     "scroll_amount": 2,                 # pixels per scroll event in the legacy runtime
 }
 

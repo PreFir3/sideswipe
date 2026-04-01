@@ -158,7 +158,8 @@ class GestureEngine:
                 self.swipe_state = 'COOLDOWN'
                 self._swipe_cooldown_end = now + self.SWIPE_COOLDOWN
                 self.partial_swipe_offset = 0
-                return 'LEFT' if disp < 0 else 'RIGHT'
+                # Camera is non-mirrored: user moves hand to THEIR left = X increases
+                return 'LEFT' if disp > 0 else 'RIGHT'
 
         return None
 

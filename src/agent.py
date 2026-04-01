@@ -364,7 +364,8 @@ class SimpleHandTracker:
         put(5, f"Brows: {m['brow_raise']:.2f} {brow_s}",
             (0, 255, 0) if m['brow_raised'] else (200, 200, 200))
 
-    def draw_hand_info(self, frame, hand_id, engine, count, y_offset):
+    def draw_hand_info(self, frame, hand_id, engine, count, y_offset,
+                       gesture_mode="---", is_pinching=False):
         """Show per-hand gesture state on screen."""
         x = 10
         y = self.height - 60 - y_offset * 80
@@ -373,12 +374,12 @@ class SimpleHandTracker:
         cv2.putText(frame, f"{hand_id} hand", (x, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
-        mode = "SWIPE" if engine.is_hand_horizontal(engine._smoothed) \
-            else ("COUNT" if engine.is_hand_vertical(engine._smoothed) else "---") \
-            if engine._smoothed is not None else "---"
+        info = f"Mode: {gesture_mode}  Swipe: {engine.swipe_state}  Fingers: {count}"
+        if is_pinching:
+            info = f"Mode: SCROLL (pinching)  Fingers: {count}"
 
-        cv2.putText(frame, f"Mode: {mode}  Swipe: {engine.swipe_state}  Fingers: {count}",
-                    (x, y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        cv2.putText(frame, info, (x, y + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
     # ──────────────────────────────────────────
     #  Main loop
@@ -437,30 +438,48 @@ class SimpleHandTracker:
                 # Count fingers (always, for display)
                 count = self.count_fingers(hand)
 
-                # ── SWIPE (horizontal hand only) ──
-                swipe_dir = engine.process_swipe(smoothed)
-                if swipe_dir:
-                    print(f"SWIPE {swipe_dir} ({hand_id})")
-                    if self.is_active:
-                        self.controller.switch_tab(swipe_dir)
+                # ── CHECK PINCH FIRST — pinch blocks swipe and finger count ──
+                thumb_tip = smoothed[self.THUMB_TIP]
+                index_tip = smoothed[self.INDEX_TIP]
+                pinch_dist = np.linalg.norm(thumb_tip - index_tip)
+                is_pinching = pinch_dist < FINGER_SCROLL["pinch_threshold"]
 
-                # ── FINGER COUNT (upright hand only) ──
-                if engine.is_hand_vertical(smoothed):
-                    tab = engine.process_finger_count(count)
-                    if tab is not None:
-                        print(f"{tab} FINGER{'S' if tab > 1 else ''} -> Tab {tab} ({hand_id})")
+                if is_pinching:
+                    # ── PINCH SCROLL (highest priority) ──
+                    scroll = self.detect_pinch_scroll(hand)
+                    if scroll:
+                        scroll_dir, scroll_amt = scroll
                         if self.is_active:
-                            self.controller.goto_tab(tab)
+                            self.controller.scroll(scroll_dir, scroll_amt)
+                    # Clear finger history so pinch doesn't build toward a tab switch
+                    engine._finger_history.clear()
+                    gesture_mode = "SCROLL"
+                else:
+                    # Not pinching — allow swipe and finger count
+                    # Reset scroll tracker for this hand when not pinching
+                    self.scroll_tracker.reset_hand(hand_id)
 
-                # ── PINCH SCROLL ──
-                scroll = self.detect_pinch_scroll(hand)
-                if scroll:
-                    scroll_dir, scroll_amt = scroll
-                    if self.is_active:
-                        self.controller.scroll(scroll_dir, scroll_amt)
+                    # ── SWIPE (horizontal hand only) ──
+                    swipe_dir = engine.process_swipe(smoothed)
+                    if swipe_dir:
+                        print(f"SWIPE {swipe_dir} ({hand_id})")
+                        if self.is_active:
+                            self.controller.switch_tab(swipe_dir)
+
+                    # ── FINGER COUNT (upright hand only) ──
+                    if engine.is_hand_vertical(smoothed):
+                        tab = engine.process_finger_count(count)
+                        if tab is not None:
+                            print(f"{tab} FINGER{'S' if tab > 1 else ''} -> Tab {tab} ({hand_id})")
+                            if self.is_active:
+                                self.controller.goto_tab(tab)
+
+                    gesture_mode = "SWIPE" if engine.is_hand_horizontal(smoothed) \
+                        else ("COUNT" if engine.is_hand_vertical(smoothed) else "---")
 
                 # Draw per-hand info
-                self.draw_hand_info(frame, hand_id, engine, count, idx)
+                self.draw_hand_info(frame, hand_id, engine, count, idx,
+                                    gesture_mode, is_pinching)
 
             # ── Clean up engines for hands that left the frame ──
             for hand_id in list(self.engines.keys()):
