@@ -16,6 +16,7 @@ import subprocess
 import os
 import argparse
 import signal
+import math
 
 # Use PyObjC for native macOS scrolling
 try:
@@ -163,55 +164,64 @@ class SimpleHandTracker:
         self.clap_cooldown = 0
         self.clap_cooldown_time = 0.5
 
-    # Swipe
-    self.swipe_start_pos = {}  # legacy (kept)
-    self.swipe_threshold = 0.15  # legacy (kept)
-    self.swipe_cooldown = 0
-    self.swipe_cooldown_time = 1.0  # seconds
-    self.swipe_min_frames = 3  # frames of consistent motion before firing
-    self.swipe_state = {}  # per hand: {"anchor": np.ndarray, "ema": np.ndarray, "dir": str, "frames": int}
-    self.swipe_anchor_reset_distance = 0.20  # if hand recenters/jumps, reset anchor
-    self.swipe_velocity_ema = {}  # per hand smoothed dx/dt in normalized units
-    self.swipe_intent_until = {}  # per hand time until which we consider the user "swiping"
-    self.swipe_intent_timeout = 0.7  # seconds
-    self.swipe_min_speed = 0.75  # normalized units per second required to count as a swipe
+        # Gesture state
+        if True:
+            # Swipe
+            self.swipe_start_pos = {}  # legacy (kept)
+            self.swipe_threshold = 0.15  # legacy (kept)
+            self.swipe_cooldown = 0.0
+            self.swipe_cooldown_time = 2.0  # seconds (enforced)
+            self.swipe_min_frames = 2  # confirm frames (more sensitive)
+            self.swipe_state = {}  # per-hand state
+            self.swipe_anchor_reset_distance = 0.24
+            self.swipe_velocity_ema = {}
+            self.swipe_intent_until = {}
+            # Timeout window ~ 4 frames (requested: 4)
+            self.swipe_intent_timeout = 4 / max(1.0, float(DETECTION.get("frame_rate", 30)))
+            # More sensitive motion (requested)
+            self.swipe_min_speed = 0.55
+                # self.swipe_min_dist_x = 0.095  # Removed minimum distance check
+            self.swipe_max_abs_dy = 0.11
 
-    # Scroll (smooth)
-    self.scroll_start_pos = {}
-    self.scroll_threshold = 0.1  # legacy (kept)
-    self.scroll_cooldown = 0
-    self.scroll_cooldown_time = 0.3  # legacy (kept)
-    self.scroll_ema = {}  # per-hand smoothed pinch point
-    self.scroll_last_time = {}  # per-hand last scroll timestamp
-    self.scroll_last_pos = {}  # per-hand last smoothed pinch position
-    self.scroll_vel_ema = {}  # per-hand smoothed dy/dt (normalized/sec)
-    self.scroll_pixel_per_norm_per_s = 1400.0  # pixels per normalized/sec
-    self.scroll_deadzone = 0.0035
-    self.scroll_max_step_pixels = 90
-    self.scroll_rate_hz = 120.0
-    self.scroll_vel_alpha = 0.35
-    self.scroll_intent_until = {}  # per hand time until which we consider the user "scrolling"
-    self.scroll_intent_timeout = 0.5
+            # Swipe gating is now based on a strong intent gesture (open hand = 5 fingers)
+            # instead of hand angle. This is more reliable across real-world camera angles.
+            self.swipe_require_open_hand = True
+            self.show_swipe_debug = True
 
-    # Tab selection by finger count
-    self.number_last = {}  # per-hand last stable count
-    self.number_frames = {}  # per-hand consecutive frames stable
-    self.number_stable_frames = 6
-    self.number_hold_start = {}  # per-hand hold start time for current count
-    self.number_hold_required = 1.0  # seconds finger count must be held
-    self.number_cooldown = {}  # per-hand cooldown timestamp
-    self.number_cooldown_time = 0.7
-    self.post_swipe_number_block_until = {}  # per-hand time until which number switching is blocked
-    self.post_swipe_number_block_time = 1.1
+            # Scroll (smooth)
+            self.scroll_start_pos = {}
+            self.scroll_threshold = 0.1  # legacy (kept)
+            self.scroll_cooldown = 0.0
+            self.scroll_cooldown_time = 0.3  # legacy (kept)
+            self.scroll_ema = {}
+            self.scroll_last_time = {}
+            self.scroll_last_pos = {}
+            self.scroll_vel_ema = {}
+            # Faster, more responsive scroll.
+            self.scroll_pixel_per_norm_per_s = 2800.0
+            self.scroll_deadzone = 0.0020
+            self.scroll_max_step_pixels = 180
+            self.scroll_rate_hz = 120.0
+            self.scroll_vel_alpha = 0.35
+            self.scroll_intent_until = {}
+            self.scroll_intent_timeout = 0.5
 
-    print(f"✓ Camera initialized ({self.width}x{self.height})")
-    print("\n📋 CONTROLS:")
-    print("  • 👏 CLAP TWICE: Toggle on/off")
-    print("  • 👆 POINT: Hover over tabs")
-    print("  • 🔄 SWIPE: Change windows (left/right)")
-    print("  • 📌 1-5 FINGERS: Jump to that tab number (hold 1s)")
-    print("  • 📜 PINCH + MOVE: Smooth scroll (up/down)")
-    print("  • 'q': Quit\n")
+            # Tab selection by finger count
+            self.number_last = {}
+            self.number_frames = {}
+            self.number_stable_frames = 6
+            self.number_hold_start = {}
+            self.number_hold_required = 1.0
+            self.number_cooldown = {}
+            self.number_cooldown_time = 0.7
+            # Prevent conflict: allow Cmd+1..4 only. "5" is reserved for swipe intent.
+            self.enable_tab_5 = False
+            self.post_swipe_number_block_until = {}
+            self.post_swipe_number_block_time = 1.1
+
+
+
+
 
     @classmethod
     def create_from_args(cls):
@@ -230,19 +240,31 @@ class SimpleHandTracker:
         if not getattr(self, "quiet", False):
             print(msg)
 
-    def _count_extended_fingers(self, landmarks: np.ndarray) -> int:
-        """Count extended fingers (1-5) using simple tip-vs-pip y comparison.
+    def _palm_axis_angle_deg(self, landmarks: np.ndarray) -> float:
+        """Return the absolute angle (degrees) of the palm axis vs vertical.
 
-        Notes:
-        - Assumes camera feed is not rotated.
-        - Works best for a roughly upright hand; good enough for tab selection.
+        Uses the vector from WRIST (0) to MIDDLE_MCP (9). 0deg means "neutral" (vertical axis).
+        Larger means the hand is rotated in the image.
+        """
+        wrist = landmarks[self.WRIST]
+        middle_mcp = landmarks[9]
+        v = middle_mcp - wrist
+        vx, vy = float(v[0]), float(v[1])
+        # Angle to vertical axis (0,1)
+        ang = abs(math.degrees(math.atan2(vx, vy)))
+        return float(ang)
+
+    def _count_extended_fingers(self, landmarks: np.ndarray) -> int:
+        """Count extended fingers (0-4) for tab selection.
+
+        We intentionally ignore the thumb here because it was the main source
+        of real-world off-by-one counts.
         """
 
         def extended(tip: int, pip: int) -> bool:
             return landmarks[tip][1] < landmarks[pip][1]
 
         count = 0
-        # Index, middle, ring, pinky
         if extended(self.INDEX_TIP, 6):
             count += 1
         if extended(self.MIDDLE_TIP, 10):
@@ -252,13 +274,32 @@ class SimpleHandTracker:
         if extended(self.PINKY_TIP, 18):
             count += 1
 
-        # Thumb: use x comparison relative to index MCP, handles left/right reasonably
+        # We only support tabs 1-5. Returning 0 means "no selection".
+        return max(0, min(5, count))
+
+    def _is_open_hand(self, landmarks: np.ndarray) -> bool:
+        """Return True if the hand is clearly open (all 5 fingers extended).
+
+        We keep tab counting thumb-free for stability, but swipe intent needs a strong
+        "open hand" signal, so we include a thumb heuristic here.
+        """
+
+        def extended(tip: int, pip: int) -> bool:
+            return landmarks[tip][1] < landmarks[pip][1]
+
+        # Four fingers (thumb excluded) must be extended
+        if not (
+            extended(self.INDEX_TIP, 6)
+            and extended(self.MIDDLE_TIP, 10)
+            and extended(self.RING_TIP, 14)
+            and extended(self.PINKY_TIP, 18)
+        ):
+            return False
+
+        # Thumb: compare thumb tip to index MCP in x, works reasonably for both hands.
         thumb_tip = landmarks[self.THUMB_TIP]
         index_mcp = landmarks[5]
-        if thumb_tip[0] < index_mcp[0] - 0.02 or thumb_tip[0] > index_mcp[0] + 0.02:
-            count += 1
-
-        return max(0, min(5, count))
+        return bool(abs(float(thumb_tip[0]) - float(index_mcp[0])) > 0.035)
 
     def detect_number_tab(self, hand):
         """Detect stable finger-count (1-5) and return a tab index (1-based).
@@ -300,6 +341,11 @@ class SimpleHandTracker:
             self.number_hold_start.pop(hand_id, None)
             return None
 
+        if count == 5 and not bool(getattr(self, "enable_tab_5", True)):
+            self.number_frames[hand_id] = 0
+            self.number_hold_start.pop(hand_id, None)
+            return None
+
         last = self.number_last.get(hand_id)
         if last == count:
             self.number_frames[hand_id] = self.number_frames.get(hand_id, 0) + 1
@@ -324,7 +370,9 @@ class SimpleHandTracker:
         self.number_cooldown[hand_id] = now + self.number_cooldown_time
         self.number_frames[hand_id] = 0
         self.number_hold_start.pop(hand_id, None)
-        return count
+
+        # Map finger count directly to Cmd+<number> (1..5)
+        return int(max(1, min(5, count)))
     
     def detect_hands(self, frame):
         """Detect hands in frame."""
@@ -393,6 +441,23 @@ class SimpleHandTracker:
         hand_id = hand['handedness']
         landmarks = hand['landmarks']
         center = self.get_hand_center(landmarks)
+
+        # Strong intent gating: require an open hand (5 fingers) to swipe.
+        # (Tab counting ignores thumb for stability, so we use a separate check here.)
+        fingers = self._count_extended_fingers(landmarks)
+        if bool(getattr(self, "swipe_require_open_hand", False)):
+            if not self._is_open_hand(landmarks):
+                if hand_id in self.swipe_start_pos:
+                    del self.swipe_start_pos[hand_id]
+                if hand_id in self.swipe_state:
+                    del self.swipe_state[hand_id]
+                self.swipe_velocity_ema.pop(hand_id, None)
+                self._swipe_debug = getattr(self, "_swipe_debug", {})
+                self._swipe_debug[hand_id] = {
+                    "reason": f"need open hand (tab-count={fingers})",
+                    "fingers": fingers,
+                }
+                return None
         
         # Check if we're pinching - if so, don't swipe
         thumb_tip = landmarks[self.THUMB_TIP]
@@ -404,6 +469,13 @@ class SimpleHandTracker:
                 del self.swipe_start_pos[hand_id]
             if hand_id in self.swipe_state:
                 del self.swipe_state[hand_id]
+            # Keep it disarmed if user is doing scroll-intent.
+            self._swipe_debug = getattr(self, "_swipe_debug", {})
+            self._swipe_debug[hand_id] = {
+                "reason": f"pinch detected (dist {thumb_index_distance:.3f})",
+                "fingers": fingers,
+                "pinch": float(thumb_index_distance),
+            }
             return None
 
         # Initialize per-hand swipe state
@@ -414,12 +486,19 @@ class SimpleHandTracker:
                 "dir": None,
                 "frames": 0,
             }
+            self._swipe_debug = getattr(self, "_swipe_debug", {})
+            self._swipe_debug[hand_id] = {
+                "reason": "init",
+                "fingers": fingers,
+                "pinch": float(thumb_index_distance),
+            }
             return None
 
         st = self.swipe_state[hand_id]
 
         # Smooth center using EMA to reduce jitter
-        alpha = 0.30
+        # Slightly higher alpha => a bit more responsive (less lag) while staying stable.
+        alpha = 0.38
         st["ema"] = (1 - alpha) * st["ema"] + alpha * center
 
         now = time.time()
@@ -438,32 +517,62 @@ class SimpleHandTracker:
         # Track swipe intent using smoothed horizontal velocity
         v_prev = self.swipe_velocity_ema.get(hand_id, 0.0)
         v_x = float(vel[0])
-        v_ema = 0.6 * v_prev + 0.4 * v_x
+        # More weight on current velocity = more sensitive / faster to react.
+        v_ema = 0.45 * v_prev + 0.55 * v_x
         self.swipe_velocity_ema[hand_id] = v_ema
 
         if abs(v_ema) >= self.swipe_min_speed:
             self.swipe_intent_until[hand_id] = now + self.swipe_intent_timeout
 
-        # If the hand recenters or jumps a lot, reset anchor to avoid accidental swipe
+        # Reset anchor if the hand drifts too far from the anchor without committing.
         if np.linalg.norm(st["ema"] - st["anchor"]) > self.swipe_anchor_reset_distance:
             st["anchor"] = st["ema"]
             st["dir"] = None
             st["frames"] = 0
+            self._swipe_debug = getattr(self, "_swipe_debug", {})
+            self._swipe_debug[hand_id] = {
+                "reason": "anchor reset",
+                "fingers": fingers,
+                "v_ema": float(v_ema),
+                "dx": float((st["ema"] - st["anchor"])[0]),
+                "dy": float((st["ema"] - st["anchor"])[1]),
+            }
             return None
+
+        # Timeout: if direction isn't confirmed quickly, drop candidate.
+        # (Requested: timeout ~ 4 frames)
+        frames_timeout = 4
+        if st.get("dir") is not None:
+            st["frames_since_dir"] = int(st.get("frames_since_dir", 0)) + 1
+            if st["frames_since_dir"] > frames_timeout and st.get("frames", 0) < self.swipe_min_frames:
+                st["dir"] = None
+                st["frames"] = 0
+                st["frames_since_dir"] = 0
 
         delta = st["ema"] - st["anchor"]
         delta_x, delta_y = float(delta[0]), float(delta[1])
 
         # Horizontal-only constraint
-        if abs(delta_y) > 0.09:
+        if abs(delta_y) > float(getattr(self, "swipe_max_abs_dy", 0.11)):
             st["dir"] = None
             st["frames"] = 0
+            st["frames_since_dir"] = 0
+            self._swipe_debug = getattr(self, "_swipe_debug", {})
+            self._swipe_debug[hand_id] = {
+                "reason": f"too vertical dy={abs(delta_y):.3f}",
+                "fingers": fingers,
+                "v_ema": float(v_ema),
+                "dx": float(delta_x),
+                "dy": float(delta_y),
+            }
             return None
 
         # Candidate direction
-        if abs(delta_x) < 0.12:
+        if abs(delta_x) < float(getattr(self, "swipe_min_dist_x", 0.095)):
             st["dir"] = None
             st["frames"] = 0
+            st["frames_since_dir"] = 0
+            # Distance check removed; skip this debug block.
             return None
 
         candidate = "LEFT" if delta_x < 0 else "RIGHT"
@@ -472,6 +581,7 @@ class SimpleHandTracker:
         else:
             st["dir"] = candidate
             st["frames"] = 1
+            st["frames_since_dir"] = 0
 
         # Require both distance and speed intent to reduce shaky accidental swipes
         if st["frames"] >= self.swipe_min_frames and abs(self.swipe_velocity_ema.get(hand_id, 0.0)) >= self.swipe_min_speed:
@@ -479,7 +589,29 @@ class SimpleHandTracker:
             st["anchor"] = st["ema"]
             st["dir"] = None
             st["frames"] = 0
+            self._swipe_debug = getattr(self, "_swipe_debug", {})
+            self._swipe_debug[hand_id] = {
+                "reason": f"FIRED {candidate}",
+                "fingers": fingers,
+                "v_ema": float(v_ema),
+                "dx": float(delta_x),
+                "dy": float(delta_y),
+                "frames": int(st.get("frames", 0)),
+            }
             return candidate
+
+        # Default diagnostic snapshot
+        self._swipe_debug = getattr(self, "_swipe_debug", {})
+        self._swipe_debug[hand_id] = {
+            "reason": f"tracking (frames {st.get('frames', 0)}/{self.swipe_min_frames})",
+            "fingers": fingers,
+            "pinch": float(thumb_index_distance),
+            "v_ema": float(v_ema),
+            "dx": float(delta_x),
+            "dy": float(delta_y),
+            "dir": st.get("dir"),
+            "frames": int(st.get("frames", 0)),
+        }
 
         return None
     
@@ -600,6 +732,11 @@ class SimpleHandTracker:
         """Main loop - track and display hands."""
         self._log("🎥 Hand tracking started...\n")
 
+        window_name = "Sideswipe"
+        if not self.headless:
+            # Make sure the window exists immediately so you can see the camera is live.
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
         # Allow clean shutdown when run as a background service
         should_stop = {"stop": False}
 
@@ -630,91 +767,108 @@ class SimpleHandTracker:
             
             # Detect hands
             hands = self.detect_hands(frame)
-            
-            # Draw hands (only when not headless)
-            if not self.headless:
-                for hand in hands:
-                    self.draw_hand(frame, hand)
-            
-            # Gesture detection
-            if len(hands) >= 2:
-                # Clap detection
-                if self.clap_cooldown <= 0 and self.detect_clap(hands):
-                    self.is_active = not self.is_active
-                    status = "✓ ACTIVATED" if self.is_active else "✗ DEACTIVATED"
-                    self._log(f"👏 CLAP DETECTED → {status}")
-                    self.clap_cooldown = self.clap_cooldown_time
-            
-            # Single hand gestures
-            for hand in hands:
-                # Swipe detection
-                if self.swipe_cooldown <= 0:
-                    swipe_dir = self.detect_swipe(hand)
-                    if swipe_dir:
-                        self._log(f"🔄 SWIPE {swipe_dir}")
-                        if self.is_active:
-                            self.controller.switch_tab(swipe_dir)
-                            time.sleep(0.1)
-                        self.swipe_cooldown = self.swipe_cooldown_time
-                        # Block finger-number switching briefly after a swipe so it can't override the swipe intent
-                        self.post_swipe_number_block_until[hand['handedness']] = time.time() + self.post_swipe_number_block_time
-                
-                # Scroll detection
-                v_ema = self.detect_two_finger_scroll(hand)
-                if v_ema is not None and self.is_active:
-                    now = time.time()
-                    last = self.scroll_last_time.get(hand['handedness'], 0.0)
-                    min_dt = 1.0 / self.scroll_rate_hz
-                    if now - last >= min_dt:
-                        self.scroll_last_time[hand['handedness']] = now
-                        delta_px = float(v_ema) * self.scroll_pixel_per_norm_per_s * float(min_dt)
-                        delta_px = float(np.clip(delta_px, -self.scroll_max_step_pixels, self.scroll_max_step_pixels))
-                        self.controller.scroll_pixels(delta_px)
 
-                # Number tab selection (stable finger count + 1s hold)
-                tab_num = self.detect_number_tab(hand)
-                if tab_num:
-                    self._log(f"📌 TAB {tab_num}")
+            # Draw overlays + run gestures
+            if hands:
+                for hand in hands:
+                    # Draw landmarks
+                    if not self.headless:
+                        self.draw_hand(frame, hand)
+
+                    # Swipe (tab switch)
+                    if self.is_active and self.swipe_cooldown <= 0:
+                        direction = self.detect_swipe(hand)
+                        if direction:
+                            self.controller.switch_tab(direction)
+                            self.swipe_cooldown = float(self.swipe_cooldown_time)
+                            # Block number-tab switching briefly after swipe
+                            self.post_swipe_number_block_until[hand["handedness"]] = time.time() + self.post_swipe_number_block_time
+
+                    # Scroll (pinch)
+                    if self.is_active and self.scroll_cooldown <= 0:
+                        v_ema = self.detect_two_finger_scroll(hand)
+                        if v_ema is not None:
+                            # Convert normalized/sec velocity to pixels/frame-ish. Clamp step size.
+                            pixels = float(v_ema) * float(self.scroll_pixel_per_norm_per_s) / max(1.0, float(DETECTION.get("frame_rate", 30)))
+                            pixels = float(np.clip(pixels, -self.scroll_max_step_pixels, self.scroll_max_step_pixels))
+                            if abs(pixels) >= 1.0:
+                                self.controller.scroll_pixels(pixels)
+
+                    # Finger count -> Cmd+Number tab jump
                     if self.is_active:
-                        n = int(min(9, max(1, tab_num)))
-                        key_code = 17 + n
-                        script = f'''
-                        tell application "System Events"
-                            key code {key_code} using {{command down}}
-                        end tell
-                        '''
-                        subprocess.run(['osascript', '-e', script], capture_output=True, timeout=1)
-                        time.sleep(0.05)
-            
+                        tab = self.detect_number_tab(hand)
+                        if tab is not None:
+                            try:
+                                # Cmd+<number> uses key code 18..23 for 1..6 etc in some layouts,
+                                # but AppleScript with keystroke is more portable.
+                                script = f'''
+                                tell application "System Events"
+                                    keystroke "{int(tab)}" using {{command down}}
+                                end tell
+                                '''
+                                subprocess.run(["osascript", "-e", script], capture_output=True, timeout=1)
+                            except:
+                                pass
+
+            # Clap toggles active on/off
+            if self.clap_cooldown <= 0 and self.detect_clap(hands):
+                self.is_active = not self.is_active
+                self.clap_cooldown = float(self.clap_cooldown_time)
+                self._log(f"{'✅ Active' if self.is_active else '⏸ Paused'}")
+
+            # UI
             if not self.headless:
-                # Display status
-                status_text = "🟢 ACTIVE" if self.is_active else "🔴 INACTIVE"
-                status_color = (0, 255, 0) if self.is_active else (0, 0, 255)
-                cv2.putText(frame, status_text, (self.width - 200, 40),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
-                
-                # Display hand count
-                if len(hands) > 0:
-                    cv2.putText(frame, f"Hands: {len(hands)}", 
-                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                               1, (0, 255, 0), 2)
-                
-                # Calculate FPS
+                # Mirror so it feels natural
+                frame_disp = cv2.flip(frame, 1)
+                status = "ACTIVE" if self.is_active else "PAUSED"
+                cv2.putText(frame_disp, f"{status}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                            (0, 255, 0) if self.is_active else (0, 200, 255), 2)
+
+                # Optional swipe debug (reason + metrics)
+                if getattr(self, "show_swipe_debug", False) and hands:
+                    try:
+                        h0 = hands[0]
+                        hid = h0["handedness"]
+                        dbg = getattr(self, "_swipe_debug", {}).get(hid, {})
+                        reason = str(dbg.get("reason", ""))
+                        fingers = dbg.get("fingers", None)
+                        pinch = dbg.get("pinch", None)
+                        v_ema = dbg.get("v_ema", None)
+                        dx = dbg.get("dx", None)
+                        dy = dbg.get("dy", None)
+
+                        line1 = f"swipe: {reason}"
+                        parts = []
+                        if fingers is not None:
+                            parts.append(f"f={int(fingers)}")
+                        if pinch is not None:
+                            parts.append(f"pinch={float(pinch):.3f}")
+                        if v_ema is not None:
+                            parts.append(f"v={float(v_ema):.2f}")
+                        if dx is not None and dy is not None:
+                            parts.append(f"dx={float(dx):.3f} dy={float(dy):.3f}")
+                        line2 = " ".join(parts)
+
+                        cv2.putText(frame_disp, line1[:60], (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        if line2:
+                            cv2.putText(frame_disp, line2[:60], (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2)
+                    except Exception:
+                        pass
+
+                # FPS
                 if frame_count % 30 == 0:
-                    elapsed = time.time() - fps_time
-                    fps = 30 / elapsed
-                    self._log(f"FPS: {fps:.1f} | Hands: {len(hands)} | Status: {'🟢 ACTIVE' if self.is_active else '🔴 INACTIVE'}")
-                    fps_time = time.time()
-                
-                cv2.imshow("Hand Tracking", frame)
+                    now = time.time()
+                    fps = 30.0 / max(1e-6, (now - fps_time))
+                    fps_time = now
+                    self._last_fps = fps
+                fps_val = getattr(self, "_last_fps", None)
+                if fps_val is not None:
+                    cv2.putText(frame_disp, f"FPS: {fps_val:.1f}", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                cv2.imshow(window_name, frame_disp)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
-            else:
-                # Headless: avoid busy loop if camera blocks less than expected
-                if frame_count % 300 == 0:
-                    # occasional heartbeat
-                    self._log(f"Heartbeat | Hands: {len(hands)} | Status: {'🟢 ACTIVE' if self.is_active else '🔴 INACTIVE'}")
 
         self.cap.release()
         if not self.headless:
