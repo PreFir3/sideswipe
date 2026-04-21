@@ -268,3 +268,18 @@ MIT
 - [MediaPipe Hand Tracking](https://google.github.io/mediapipe/solutions/hands)
 - [MediaPipe Face Detection](https://google.github.io/mediapipe/solutions/face_detection)
 - [OpenCV Documentation](https://docs.opencv.org/)
+
+## Submission
+
+**Due:** April 2 by 11:59pm | **Points:** 25
+
+Submit **one document per team (PDF or Google Doc)** containing the following three links:
+
+1. **Deployed link** — Live prototype hosted on Netlify, Cloudflare Pages, or GitHub Pages
+2. **GitHub repo link** — This repo, with a clean staged commit history and a README that includes:
+   - Which states from the Control Language Map are implemented
+   - How detection works for each state (plain language, not just code)
+   - Calibration log (thresholds tried, adjusted, and settled on)
+   - Diptych pole note (which pole this prototype serves, and what the other would require)
+   - Known limitations
+3. **Screen recording link** — Under 2 minutes, one team member demoing the implemented states live while narrating what the system senses and how it responds
