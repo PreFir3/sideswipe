@@ -2,6 +2,9 @@
 
 A stable hand tracking system for macOS that lets you control your computer using hand gestures. Built with MediaPipe and optimized for natural hand movements at any angle.
 
+## Demo Link
+https://sideswipe-demo.netlify.app/
+
 ## Collaborators
 - Daniel Fitzpatrick (Response lead) (Vice Project Manager)
 - Dylan Eytan (Integration Lead) (State Engine Lead)
